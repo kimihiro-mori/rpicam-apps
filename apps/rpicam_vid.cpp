@@ -217,7 +217,7 @@ static void event_loop(RPiCamEncoder &app)
 			if (std::chrono::duration_cast<std::chrono::milliseconds>(now2 - last_sent).count() >= interval_ms)
 			{
 				last_sent = now2;
-				FrameBuffer *buf = completed_request->buffers[lores_stream];
+				libcamera::FrameBuffer *buf = completed_request->buffers[lores_stream];
 				if (buf)
 				{
 					BufferReadSync r(&app, buf);
