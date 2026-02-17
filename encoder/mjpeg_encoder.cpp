@@ -86,7 +86,7 @@ void MjpegEncoder::encodeThread(int num)
         auto start_time = std::chrono::high_resolution_clock::now();
         bool ok = enc.Encode(static_cast<const uint8_t *>(encode_item.mem),
                              encode_item.info,
-                             options_->Get().quality,
+                             options_->quality,
                              encoded_buffer,
                              buffer_len);
         encode_time += (std::chrono::high_resolution_clock::now() - start_time);
