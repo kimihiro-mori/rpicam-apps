@@ -6,8 +6,18 @@
  */
 
 #include <algorithm>
+#include <array>
+#include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <sys/mman.h>
+
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/opencv.hpp>
+
+#include "core/dl_lib.hpp"
 
 #include "hailo_postprocessing_stage.hpp"
 
@@ -17,6 +27,105 @@ using namespace hailort;
 
 using Rectangle = libcamera::Rectangle;
 using Size = libcamera::Size;
+
+namespace
+{
+
+class Display
+{
+public:
+	static MessageQueue &GetDisplayMsgQueue()
+	{
+		static Display display_instance;
+		return display_instance.msg_queue_;
+	}
+
+private:
+	Display()
+	{
+		display_thread_ = std::thread(&Display::displayThread, this);
+		init_ = true;
+	}
+
+	MessageQueue msg_queue_;
+
+	~Display()
+	{
+		if (init_)
+		{
+			msg_queue_.Post(Msg(MsgType::Quit));
+			display_thread_.join();
+		}
+	}
+
+	void displayThread();
+
+	std::thread display_thread_;
+	bool init_ = false;
+};
+
+// Singleton class for the hardware virtual device.
+class vdevice
+{
+public:
+	vdevice(vdevice &other) = delete;
+	void operator=(const vdevice &) = delete;
+
+	static VDevice *get_instance()
+	{
+		static std::unique_ptr<VDevice> _vdevice {};
+
+		if (!_vdevice)
+		{
+			Expected<std::unique_ptr<VDevice>> vdevice_exp = VDevice::create();
+			if (!vdevice_exp)
+			{
+				LOG_ERROR("Failed create vdevice, status = " << vdevice_exp.status());
+				return nullptr;
+			}
+			_vdevice = vdevice_exp.release();
+		}
+
+		return _vdevice.get();
+	}
+
+private:
+	vdevice() {}
+};
+
+// Sigh :(
+std::string get_hailo_architecture()
+{
+	const std::string cmd("hailortcli fw-control identify");
+	const std::string target_label("Device Architecture: ");
+	std::array<char, 128> buffer;
+
+	auto deleter = [](FILE *f) { pclose(f); };
+	std::unique_ptr<FILE, decltype(deleter)> pipe(popen(cmd.c_str(), "r"), deleter);
+
+	if (!pipe)
+	{
+		LOG_ERROR("Could not open pipe for Hailo identify");
+		return {};
+	}
+
+	while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr)
+	{
+		std::string line(buffer.data());
+		size_t pos = line.find(target_label);
+		if (pos != std::string::npos)
+		{
+			std::string arch = line.substr(pos + target_label.length());
+			arch.erase(arch.find_last_not_of(" \n\r\t") + 1);
+			return arch;
+		}
+	}
+
+	return {};
+}
+
+} // namespace
+
 
 Allocator::Allocator()
 {
@@ -74,7 +183,7 @@ void Allocator::free(uint8_t *ptr)
 }
 
 HailoPostProcessingStage::HailoPostProcessingStage(RPiCamApp *app)
-	: PostProcessingStage(app)
+	: PostProcessingStage(app), msg_queue_(std::ref(Display::GetDisplayMsgQueue()))
 {
 }
 
@@ -86,7 +195,10 @@ HailoPostProcessingStage::~HailoPostProcessingStage()
 
 void HailoPostProcessingStage::Read(boost::property_tree::ptree const &params)
 {
-	hef_file_ = params.get<std::string>("hef_file");
+	hef_file_ = params.get<std::string>("hef_file", "");
+	hef_file_8_ = params.get<std::string>("hef_file_8", "");
+	hef_file_8L_ = params.get<std::string>("hef_file_8L", "");
+	hef_file_10_ = params.get<std::string>("hef_file_10", "");
 }
 
 void HailoPostProcessingStage::Configure()
@@ -111,16 +223,43 @@ void HailoPostProcessingStage::Configure()
 
 int HailoPostProcessingStage::configureHailoRT()
 {
-	Expected<std::unique_ptr<VDevice>> vdevice_exp = VDevice::create();
-	if (!vdevice_exp)
+	vdevice_ = vdevice::get_instance();
+	if (!vdevice_)
 	{
-		LOG_ERROR("Failed create vdevice, status = " << vdevice_exp.status());
-		return vdevice_exp.status();
+		LOG_ERROR("Failed to get a vdevice instance.");
+		return -1;
 	}
-	vdevice_ = vdevice_exp.release();
+
+	std::string device = get_hailo_architecture();
+	if (device.empty())
+	{
+		LOG_ERROR("Defaulting to HAILO8 architecture");
+		device = "HAILO8";
+	}
+	else
+		LOG(1, "Hailo device: " << device);
+
+	std::string hef_file;
+	if (device == "HAILO10H")
+		hef_file = hef_file_10_;
+	else if (device == "HAILO8")
+		hef_file = hef_file_8_;
+	else if (device == "HAILO8L")
+		hef_file = hef_file_8L_;
+	else
+		LOG_ERROR("Unexpected Hailo architecture detected: " << device);
+
+	if (hef_file.empty())
+		hef_file = hef_file_;
+
+	if (hef_file.empty())
+	{
+		LOG_ERROR("Unable to use a suitable HEF file.");
+		return -1;
+	}
 
 	// Create infer model from HEF file.
-	Expected<std::shared_ptr<InferModel>> infer_model_exp = vdevice_->create_infer_model(hef_file_);
+	Expected<std::shared_ptr<InferModel>> infer_model_exp = vdevice_->create_infer_model(hef_file);
 	if (!infer_model_exp)
 	{
 		LOG_ERROR("Failed to create infer model, status = " << infer_model_exp.status());
@@ -241,17 +380,31 @@ HailoROIPtr HailoPostProcessingStage::MakeROI(const std::vector<OutTensor> &outp
 
 	for (auto const &t : output_tensors)
 	{
-		hailo_vstream_info_t info;
+		hailo_tensor_metadata_t info;
 
 		strncpy(info.name, t.name.c_str(), sizeof(info.name));
 		// To keep GCC quiet...
 		info.name[HAILO_MAX_STREAM_NAME_SIZE - 1] = '\0';
-		info.format = t.format;
-		info.quant_info = t.quant_info;
-		if (HailoRTCommon::is_nms(info))
-			info.nms_shape = infer_model_->outputs()[0].get_nms_shape().release();
+		info.format.type = (HailoTensorFormatType)t.format.type;
+		info.format.is_nms = infer_model_->outputs()[0].is_nms();
+		info.quant_info.qp_zp = t.quant_info.qp_zp;
+		info.quant_info.qp_scale = t.quant_info.qp_scale;
+		info.quant_info.limvals_min = t.quant_info.limvals_min;
+		info.quant_info.limvals_max = t.quant_info.limvals_max;
+		if (info.format.is_nms)
+		{
+			auto i = infer_model_->outputs()[0].get_nms_shape().release();
+			info.nms_shape.number_of_classes = i.number_of_classes;
+			info.nms_shape.max_bboxes_per_class = i.max_bboxes_per_class;
+			info.nms_shape.max_bboxes_total = i.max_bboxes_total;
+			info.nms_shape.max_accumulated_mask_size = i.max_accumulated_mask_size;
+		}
 		else
-			info.shape = t.shape;
+		{
+			info.shape.height = t.shape.height;
+			info.shape.width = t.shape.width;
+			info.shape.features = t.shape.features;
+		}
 
 		roi->add_tensor(std::make_shared<HailoTensor>(t.data.get(), info));
 	}
@@ -285,4 +438,41 @@ Rectangle HailoPostProcessingStage::ConvertInferenceCoordinates(const std::vecto
 	const Rectangle obj_scaled = obj_translated_h.scaledBy(isp_output_size, scaler_crops[0].size());
 
 	return obj_scaled;
+}
+
+void Display::displayThread()
+{
+	RgbImagePtr current_image;
+
+	while (true)
+	{
+		Msg msg = msg_queue_.Wait();
+
+		if (msg.type == MsgType::Quit)
+			break;
+
+		if (msg.type == MsgType::Display)
+		{
+			current_image = std::move(msg.payload);
+
+			// RGB -> BGR for cv::imshow
+			for (unsigned int j = 0; j < msg.size.height; j++)
+			{
+				uint8_t *ptr = current_image.get() + j * msg.size.width * 3;
+				for (unsigned int i = 0; i < msg.size.width; i++)
+				{
+					const uint8_t t = ptr[0];
+					ptr[0] = ptr[2], ptr[2] = t;
+					ptr += 3;
+				}
+			}
+			
+			cv::Mat image(msg.size.height, msg.size.width, CV_8UC3, (void *)current_image.get(),
+						  msg.size.width * 3);
+
+			cv::imshow(msg.window_title, image);
+			cv::resizeWindow(msg.window_title, cv::Size(320, 320));
+			cv::waitKey(1);
+		}
+	}
 }

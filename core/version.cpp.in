@@ -4,11 +4,35 @@
  *
  * AUTO-GENERATED, DO NOT MODIFY!
  */
+#include <string>
+
 #include "core/version.hpp"
+#include "encoder/encoder.hpp"
+#include "preview/preview.hpp"
 
-static const std::string versionString {"@VER@"};
+extern "C" {
 
-const std::string& RPiCamAppsVersion()
+const char *RPiCamAppsVersion()
 {
-    return versionString;
+	static const std::string version {"@VER@"};
+	return version.c_str();
+}
+
+const char *RPiCamAppsCapabilities(const std::string &preview_libs, const std::string &encoder_libs)
+{
+	auto &p = PreviewFactory::GetInstance();
+	p.LoadPreviewLibraries(preview_libs);
+
+	auto &e = EncoderFactory::GetInstance();
+	e.LoadEncoderLibraries(encoder_libs);
+
+	static const std::string caps = 
+		"egl:" + std::to_string(p.HasPreview("egl")) + 
+		" qt:" + std::to_string(p.HasPreview("qt")) +
+		" drm:" + std::to_string(p.HasPreview("drm")) +
+		" libav:" + std::to_string(e.HasEncoder("libav"));
+
+	return caps.c_str();
+}
+
 }

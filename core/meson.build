@@ -5,6 +5,7 @@ rpicam_app_dep += [boost_dep, thread_dep]
 
 rpicam_app_src += files([
     'buffer_sync.cpp',
+    'dl_lib.cpp',
     'dma_heaps.cpp',
     'rpicam_app.cpp',
     'options.cpp',
@@ -15,6 +16,7 @@ rpicam_app_src += files([
 core_headers = files([
     'buffer_sync.hpp',
     'completed_request.hpp',
+    'dl_lib.hpp',
     'dma_heaps.hpp',
     'frame_info.hpp',
     'rpicam_app.hpp',
@@ -30,37 +32,4 @@ core_headers = files([
     'jpeg_yuv420.hpp',
 ])
 
-# Generate a version string.
-version_cmd = [meson.project_source_root() / 'utils' / 'version.py', meson.project_version()]
-
-# Check if a version.gen file is present.
-# This would have been generated from the meson dist command.
-fs = import('fs')
-dist_version_file = meson.project_source_root() / 'version.gen'
-if fs.is_file(dist_version_file)
-    version_cmd += fs.read(dist_version_file)
-endif
-
-version_cpp = vcs_tag(command : version_cmd,
-                      replace_string: '@VER@',
-                      input : 'version.cpp.in',
-                      output : 'version.cpp',
-                      fallback : meson.project_version())
-
-rpicam_app_src += version_cpp
-
 install_headers(core_headers, subdir: meson.project_name() / 'core')
-
-# Install symlinks to the old header directories and names for legacy purposes.
-install_symlink('libcamera-apps',
-                install_dir: get_option('includedir'),
-                pointing_to: 'rpicam-apps')
-
-inc_install_dir = get_option('includedir') / meson.project_name() / 'core'
-install_symlink('libcamera_app.h',
-                install_dir: inc_install_dir,
-                pointing_to: 'rpicam_app.hpp')
-
-install_symlink('libcamera_encoder.h',
-                install_dir: inc_install_dir,
-                pointing_to: 'rpicam_encoder.hpp')
