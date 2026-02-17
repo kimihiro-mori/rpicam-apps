@@ -10,6 +10,7 @@ rpicam_app_src += files([
     'rpicam_app.cpp',
     'options.cpp',
     'post_processor.cpp',
+    'jpeg_yuv420.cpp',
 ])
 
 core_headers = files([
@@ -28,6 +29,7 @@ core_headers = files([
     'stream_info.hpp',
     'version.hpp',
     'video_options.hpp',
+    'jpeg_yuv420.hpp',
 ])
 
 install_headers(core_headers, subdir: meson.project_name() / 'core')
