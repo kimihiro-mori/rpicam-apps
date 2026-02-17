@@ -10,9 +10,18 @@
 #include <signal.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
+#include <fcntl.h>
 
 #include "core/rpicam_encoder.hpp"
 #include "output/output.hpp"
+#include "core/jpeg_yuv420.hpp"
 
 using namespace std::placeholders;
 
@@ -60,6 +69,62 @@ static int get_colourspace_flags(std::string const &codec)
 		return RPiCamEncoder::FLAG_VIDEO_NONE;
 }
 
+struct UdpJpegSender
+{
+	int fd = -1;
+	sockaddr_in addr {};
+	bool enabled = false;
+
+	~UdpJpegSender()
+	{
+		if (fd >= 0) ::close(fd);
+	}
+
+	static std::optional<UdpJpegSender> FromEnv()
+	{
+		// Check for an environment variable of the "RPICAM_LORES_UDP"
+		const char *s = std::getenv("RPICAM_LORES_UDP");
+		if (!s || !*s) return std::nullopt;
+
+		// Expect it to be in the form "IP:PORT", e.g. "127.0.0.1:5001"
+		std::string spec(s);
+		auto pos = spec.find(':');
+		if (pos == std::string::npos) return std::nullopt;
+
+		std::string ip = spec.substr(0, pos);
+		int port = std::atoi(spec.substr(pos + 1).c_str());
+		if (port <= 0) return std::nullopt;
+
+		// Create a UDP socket for sending JPEG frames to the specified address
+		UdpJpegSender sender;
+		sender.fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+		if (sender.fd < 0) return std::nullopt;
+
+		std::memset(&sender.addr, 0, sizeof(sender.addr));
+		sender.addr.sin_family = AF_INET;
+		sender.addr.sin_port = htons(port);
+		if (::inet_pton(AF_INET, ip.c_str(), &sender.addr.sin_addr) != 1) return std::nullopt;
+
+		// Set the socket to non-blocking mode
+		int flags = fcntl(sender.fd, F_GETFL, 0);
+		fcntl(sender.fd, F_SETFL, flags | O_NONBLOCK);
+
+		sender.enabled = true;
+		return sender;
+	}
+
+	void SendOneFrame(const uint8_t *data, size_t len)
+	{
+		if (!enabled) return;
+		if (len > 65000)
+		{
+			LOG_ERROR("UDP JPEG drop: packet too large (" << len << " bytes)");
+			return;
+		}
+		::sendto(fd, data, len, 0, (sockaddr *)&addr, sizeof(addr));
+	}
+};
+
 // The main even loop for the application.
 
 static void event_loop(RPiCamEncoder &app)
@@ -71,6 +136,29 @@ static void event_loop(RPiCamEncoder &app)
 
 	app.OpenCamera();
 	app.ConfigureVideo(get_colourspace_flags(options->codec));
+
+	// Set up the lores stream and UDP sender
+	// %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+	StreamInfo lores_info;
+	libcamera::Stream *lores_stream = app.LoresStream(&lores_info);
+
+	auto senderOpt = UdpJpegSender::FromEnv();
+	UdpJpegSender sender;
+	if (senderOpt) sender = std::move(*senderOpt);
+
+	int interval_ms = 33; // default ~30fps
+	if (const char *s = std::getenv("RPICAM_LORES_INTERVAL_MS"))
+		interval_ms = std::max(1, std::atoi(s));
+
+	int jpeg_quality = 70;
+	if (const char *s = std::getenv("RPICAM_LORES_JPEG_QUALITY"))
+		jpeg_quality = std::min(95, std::max(30, std::atoi(s)));
+
+	auto last_sent = std::chrono::high_resolution_clock::now();
+
+	JpegYuv420Encoder lores_jpeg_enc;
+	// %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 	app.StartEncoder();
 	app.StartCamera();
 	auto start_time = std::chrono::high_resolution_clock::now();
@@ -120,6 +208,34 @@ static void event_loop(RPiCamEncoder &app)
 
 		CompletedRequestPtr &completed_request = std::get<CompletedRequestPtr>(msg.payload);
 		app.EncodeBuffer(completed_request, app.VideoStream());
+		
+		// Send the lores stream as JPEG over UDP if enabled
+		// %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+		if (lores_stream && sender.enabled)
+		{
+			auto now2 = std::chrono::high_resolution_clock::now();
+			if (std::chrono::duration_cast<std::chrono::milliseconds>(now2 - last_sent).count() >= interval_ms)
+			{
+				last_sent = now2;
+				FrameBuffer *buf = completed_request->buffers[lores_stream];
+				if (buf)
+				{
+					BufferReadSync r(&app, buf);
+					libcamera::Span<uint8_t> span = r.Get()[0];
+
+					uint8_t *jpg = nullptr;
+					size_t jpg_len = 0;
+
+					if (lores_jpeg_enc.Encode(span.data(), lores_info, jpeg_quality, jpg, jpg_len))
+					{
+						sender.SendOneFrame(jpg, jpg_len);
+						free(jpg);
+					}
+				}
+			}
+		}
+		// %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 		app.ShowPreview(completed_request, app.VideoStream());
 	}
 }
