@@ -54,6 +54,14 @@ public:
 	VideoOptions *GetOptions() const { return static_cast<VideoOptions *>(options_.get()); }
 	void StopEncoder() { encoder_.reset(); }
 
+	// Return the number of frames currently queued for encoding (i.e. buffers
+	// held by the encoder pipeline that haven't been returned yet).
+	size_t EncodeBufferQueueSize() const
+	{
+		std::lock_guard<std::mutex> lock(encode_buffer_queue_mutex_);
+		return encode_buffer_queue_.size();
+	}
+
 protected:
 	virtual void createEncoder()
 	{
@@ -85,7 +93,7 @@ private:
 	}
 
 	std::queue<CompletedRequestPtr> encode_buffer_queue_;
-	std::mutex encode_buffer_queue_mutex_;
+	mutable std::mutex encode_buffer_queue_mutex_;
 	EncodeOutputReadyCallback encode_output_ready_callback_;
 	MetadataReadyCallback metadata_ready_callback_;
 };
