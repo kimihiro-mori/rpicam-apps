@@ -339,18 +339,23 @@ void RPiCamApp::ConfigureViewfinder()
 		configuration_->at(lores_stream_num).bufferCount = configuration_->at(0).bufferCount;
 	}
 
+	options_->viewfinder_mode.update(size, options_->framerate);
+	options_->viewfinder_mode = selectMode(options_->viewfinder_mode);
+
 	if (!options_->no_raw)
 	{
-		options_->viewfinder_mode.update(size, options_->framerate);
-		options_->viewfinder_mode = selectMode(options_->viewfinder_mode);
-
 		configuration_->at(raw_stream_num).size = options_->viewfinder_mode.Size();
 		configuration_->at(raw_stream_num).pixelFormat = mode_to_pixel_format(options_->viewfinder_mode);
 		configuration_->at(raw_stream_num).bufferCount = configuration_->at(0).bufferCount;
-		configuration_->sensorConfig = libcamera::SensorConfiguration();
-		configuration_->sensorConfig->outputSize = options_->viewfinder_mode.Size();
-		configuration_->sensorConfig->bitDepth = options_->viewfinder_mode.bit_depth;
 	}
+
+	/*
+	 * Always set the sensor configuration so that --mode bit-depth
+	 * is honoured even with --no-raw.
+	 */
+	configuration_->sensorConfig = libcamera::SensorConfiguration();
+	configuration_->sensorConfig->outputSize = options_->viewfinder_mode.Size();
+	configuration_->sensorConfig->bitDepth = options_->viewfinder_mode.bit_depth;
 
 	configuration_->orientation = libcamera::Orientation::Rotate0 * options_->transform;
 
@@ -403,18 +408,23 @@ void RPiCamApp::ConfigureZsl(unsigned int still_flags)
 
 	post_processor_.AdjustConfig("still", &configuration_->at(0));
 
+	options_->mode.update(configuration_->at(0).size, options_->framerate);
+	options_->mode = selectMode(options_->mode);
+
 	if (!options_->no_raw)
 	{
-		options_->mode.update(configuration_->at(0).size, options_->framerate);
-		options_->mode = selectMode(options_->mode);
-
 		configuration_->at(2).size = options_->mode.Size();
 		configuration_->at(2).pixelFormat = mode_to_pixel_format(options_->mode);
-		configuration_->sensorConfig = libcamera::SensorConfiguration();
-		configuration_->sensorConfig->outputSize = options_->mode.Size();
-		configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
 		configuration_->at(2).bufferCount = configuration_->at(0).bufferCount;
 	}
+
+	/*
+	 * Always set the sensor configuration so that --mode bit-depth
+	 * is honoured even with --no-raw.
+	 */
+	configuration_->sensorConfig = libcamera::SensorConfiguration();
+	configuration_->sensorConfig->outputSize = options_->mode.Size();
+	configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
 
 	Size size(1280, 960);
 	auto area = camera_->properties().get(properties::PixelArrayActiveAreas);
@@ -505,18 +515,23 @@ void RPiCamApp::ConfigureStill(unsigned int flags)
 
 	post_processor_.AdjustConfig("still", &configuration_->at(0));
 
+	options_->mode.update(configuration_->at(0).size, options_->framerate);
+	options_->mode = selectMode(options_->mode);
+
 	if (!options_->no_raw)
 	{
-		options_->mode.update(configuration_->at(0).size, options_->framerate);
-		options_->mode = selectMode(options_->mode);
-
 		configuration_->at(1).size = options_->mode.Size();
 		configuration_->at(1).pixelFormat = mode_to_pixel_format(options_->mode);
-		configuration_->sensorConfig = libcamera::SensorConfiguration();
-		configuration_->sensorConfig->outputSize = options_->mode.Size();
-		configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
 		configuration_->at(1).bufferCount = configuration_->at(0).bufferCount;
 	}
+
+	/*
+	 * Always set the sensor configuration so that --mode bit-depth
+	 * is honoured even with --no-raw.
+	 */
+	configuration_->sensorConfig = libcamera::SensorConfiguration();
+	configuration_->sensorConfig->outputSize = options_->mode.Size();
+	configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
 
 	configureDenoise(options_->denoise == "auto" ? "cdn_hq" : options_->denoise);
 	setupCapture();
@@ -565,18 +580,23 @@ void RPiCamApp::ConfigureVideo(unsigned int flags)
 
 	post_processor_.AdjustConfig("video", &configuration_->at(0));
 
+	options_->mode.update(configuration_->at(0).size, options_->framerate);
+	options_->mode = selectMode(options_->mode);
+
 	if (!options_->no_raw)
 	{
-		options_->mode.update(configuration_->at(0).size, options_->framerate);
-		options_->mode = selectMode(options_->mode);
-
 		configuration_->at(1).size = options_->mode.Size();
 		configuration_->at(1).pixelFormat = mode_to_pixel_format(options_->mode);
-		configuration_->sensorConfig = libcamera::SensorConfiguration();
-		configuration_->sensorConfig->outputSize = options_->mode.Size();
-		configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
 		configuration_->at(1).bufferCount = configuration_->at(0).bufferCount;
 	}
+
+	/*
+	 * Always set the sensor configuration (output size and bit depth)
+	 * so that --mode bit-depth is honoured even with --no-raw.
+	 */
+	configuration_->sensorConfig = libcamera::SensorConfiguration();
+	configuration_->sensorConfig->outputSize = options_->mode.Size();
+	configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
 
 	if (have_lores_stream)
 	{
