@@ -358,7 +358,7 @@ static void event_loop(RPiCamEncoder &app)
 				{
 					unsigned int missed = static_cast<unsigned int>(gap_us / expected_us + 0.5) - 1;
 					drop_count += missed;
-					LOG(2, "Frame drop detected: gap " << static_cast<int>(gap_us)
+					LOG(1, "Frame drop detected: gap " << static_cast<int>(gap_us)
 						<< "us (expected " << static_cast<int>(expected_us) << "us), ~"
 						<< missed << " frame(s) missed");
 				}
@@ -375,7 +375,7 @@ static void event_loop(RPiCamEncoder &app)
 		{
 			double elapsed_s = std::chrono::duration<double>(now - last_report).count();
 			double measured_fps = frames_since_report / elapsed_s;
-			LOG(2, "Throughput: " << std::fixed << std::setprecision(1) << measured_fps
+			LOG(1, "Throughput: " << std::fixed << std::setprecision(1) << measured_fps
 				<< " fps (target " << target_fps
 				<< "), enc queue: " << enc_q << "/" << options->buffer_count
 				<< " (peak " << enc_queue_peak << ")"
