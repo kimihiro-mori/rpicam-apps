@@ -5,6 +5,9 @@
  * file_output.cpp - Write output to file.
  */
 
+#include <chrono>
+#include <ctime>
+
 #include "file_output.hpp"
 
 FileOutput::FileOutput(VideoOptions const *options)
@@ -49,7 +52,23 @@ void FileOutput::openFile(int64_t timestamp_us)
 	{
 		// Generate the next output file name.
 		char filename[256];
-		int n = snprintf(filename, sizeof(filename), options_->output.c_str(), count_);
+		int n;
+
+		if (options_->output.find("%s") != std::string::npos)
+		{
+			// Timestamp-based naming: %s is replaced with YYYYMMDD_HHMMSS
+			auto now = std::chrono::system_clock::now();
+			auto tt = std::chrono::system_clock::to_time_t(now);
+			struct tm tm;
+			localtime_r(&tt, &tm);
+			char ts[20];
+			strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm);
+			n = snprintf(filename, sizeof(filename), options_->output.c_str(), ts);
+		}
+		else
+		{
+			n = snprintf(filename, sizeof(filename), options_->output.c_str(), count_);
+		}
 		count_++;
 		if (options_->wrap)
 			count_ = count_ % options_->wrap;
