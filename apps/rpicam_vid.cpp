@@ -15,12 +15,15 @@
 #include <mutex>
 #include <poll.h>
 #include <signal.h>
+#include <sstream>
 #include <thread>
 #include <unistd.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+
+#include <libcamera/controls.h>
 
 #include "core/rpicam_encoder.hpp"
 #include "core/jpeg_yuv420.hpp"
@@ -137,6 +140,181 @@ private:
 		fd_ = o.fd_; addr_ = o.addr_;
 		o.fd_ = -1;
 	}
+};
+
+// ---------------------------------------------------------------------------
+// UDP control receiver – reads RPICAM_CONTROL_UDP env ("port")
+// ---------------------------------------------------------------------------
+
+class UdpControlReceiver
+{
+public:
+	UdpControlReceiver() = default;
+	~UdpControlReceiver() { Stop(); }
+
+	UdpControlReceiver(const UdpControlReceiver &) = delete;
+	UdpControlReceiver &operator=(const UdpControlReceiver &) = delete;
+	UdpControlReceiver(UdpControlReceiver &&o) noexcept
+		: fd_(o.fd_), stop_(o.stop_.load()), app_(o.app_), options_(o.options_)
+	{
+		o.fd_ = -1;
+		o.app_ = nullptr;
+		o.options_ = nullptr;
+	}
+	UdpControlReceiver &operator=(UdpControlReceiver &&o) noexcept
+	{
+		if (this != &o)
+		{
+			Stop();
+			fd_ = o.fd_; stop_ = o.stop_.load();
+			app_ = o.app_; options_ = o.options_;
+			o.fd_ = -1; o.app_ = nullptr; o.options_ = nullptr;
+		}
+		return *this;
+	}
+
+	static UdpControlReceiver Create()
+	{
+		const char *s = std::getenv("RPICAM_CONTROL_UDP");
+		if (!s || !*s) return {};
+		int port = std::atoi(s);
+		if (port <= 0) return {};
+
+		UdpControlReceiver out;
+		out.fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+		if (out.fd_ < 0) return {};
+
+		int opt = 1;
+		setsockopt(out.fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(port);
+		addr.sin_addr.s_addr = htonl(INADDR_ANY);
+		if (::bind(out.fd_, (sockaddr *)&addr, sizeof(addr)) < 0)
+		{
+			::close(out.fd_);
+			out.fd_ = -1;
+			return {};
+		}
+
+		LOG(1, "UdpControlReceiver: listening on port " << port);
+		return out;
+	}
+
+	bool enabled() const { return fd_ >= 0; }
+
+	void Start(RPiCamEncoder *app, VideoOptions *options)
+	{
+		if (!enabled()) return;
+		app_ = app;
+		options_ = options;
+		stop_ = false;
+		thread_ = std::thread([this] { recvLoop(); });
+	}
+
+	void Stop()
+	{
+		if (!enabled()) return;
+		stop_ = true;
+		// Unblock recvfrom by sending a dummy packet to ourselves
+		if (fd_ >= 0)
+		{
+			sockaddr_in self{};
+			self.sin_family = AF_INET;
+			socklen_t len = sizeof(self);
+			getsockname(fd_, (sockaddr *)&self, &len);
+			self.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+			char dummy = 0;
+			::sendto(fd_, &dummy, 1, 0, (sockaddr *)&self, sizeof(self));
+		}
+		if (thread_.joinable()) thread_.join();
+		if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+	}
+
+private:
+	void recvLoop()
+	{
+		char buf[1024];
+		while (!stop_)
+		{
+			ssize_t n = ::recvfrom(fd_, buf, sizeof(buf) - 1, 0, nullptr, nullptr);
+			if (n <= 0 || stop_) continue;
+			buf[n] = '\0';
+			processCommand(buf);
+		}
+	}
+
+	void processCommand(const char *buf)
+	{
+		libcamera::ControlList cl(libcamera::controls::controls);
+		std::istringstream iss(buf);
+		std::string line;
+
+		while (std::getline(iss, line))
+		{
+			if (line.empty()) continue;
+			auto eq = line.find('=');
+			if (eq == std::string::npos) continue;
+
+			std::string key = line.substr(0, eq);
+			std::string val = line.substr(eq + 1);
+
+			if (key == "shutter")
+			{
+				int us = std::atoi(val.c_str());
+				if (us > 0)
+					cl.set(libcamera::controls::ExposureTime, us);
+				LOG(1, "Control: shutter=" << us << "us");
+			}
+			else if (key == "gain")
+			{
+				float g = std::atof(val.c_str());
+				if (g > 0)
+					cl.set(libcamera::controls::AnalogueGain, g);
+				LOG(1, "Control: gain=" << g);
+			}
+			else if (key == "awb")
+			{
+				int mode = std::atoi(val.c_str());
+				cl.set(libcamera::controls::AwbMode, mode);
+				LOG(1, "Control: awb=" << mode);
+			}
+			else if (key == "awbgains")
+			{
+				auto comma = val.find(',');
+				if (comma != std::string::npos)
+				{
+					float r = std::atof(val.substr(0, comma).c_str());
+					float b = std::atof(val.substr(comma + 1).c_str());
+					float gains[2] = { r, b };
+					cl.set(libcamera::controls::ColourGains,
+						   libcamera::Span<const float, 2>(gains));
+					LOG(1, "Control: awbgains=" << r << "," << b);
+				}
+			}
+			else if (key == "quality")
+			{
+				int q = std::clamp(std::atoi(val.c_str()), 1, 100);
+				if (options_)
+					options_->Set().quality = q;
+				LOG(1, "Control: quality=" << q);
+			}
+			else
+			{
+				LOG(1, "Control: unknown key '" << key << "'");
+			}
+		}
+
+		if (!cl.empty() && app_)
+			app_->SetControls(cl);
+	}
+
+	int fd_ = -1;
+	std::atomic<bool> stop_{false};
+	std::thread thread_;
+	RPiCamEncoder *app_ = nullptr;
+	VideoOptions *options_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -280,6 +458,10 @@ static void event_loop(RPiCamEncoder &app)
 	LoresForwarder lores(sender);
 	lores.Start();
 
+	// UDP control receiver – allows runtime parameter changes
+	UdpControlReceiver ctrl = UdpControlReceiver::Create();
+	ctrl.Start(&app, const_cast<VideoOptions *>(options));
+
 	app.StartEncoder();
 	app.StartCamera();
 	auto start_time = Clock::now();
@@ -288,7 +470,7 @@ static void event_loop(RPiCamEncoder &app)
 		signal(sig, default_signal_handler);
 	pollfd p[1] = { { STDIN_FILENO, POLLIN, 0 } };
 
-	auto shutdown = [&] { lores.Stop(); };
+	auto shutdown = [&] { ctrl.Stop(); lores.Stop(); };
 
 	// Frame-drop monitoring: log a warning every reporting interval if the
 	// measured framerate falls below the requested rate.
