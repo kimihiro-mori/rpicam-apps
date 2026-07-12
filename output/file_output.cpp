@@ -6,13 +6,27 @@
  */
 
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 
 #include "file_output.hpp"
 
+// One record per saved frame in the <output>.frames sidecar (native little-endian).
+struct FrameSidecarRecord
+{
+	uint32_t index;
+	uint32_t byte_size;
+	int64_t sensor_ts_ns;
+	uint64_t byte_offset;
+};
+static_assert(sizeof(FrameSidecarRecord) == 24, "sidecar record must stay 24 bytes");
+
 FileOutput::FileOutput(VideoOptions const *options)
 	: Output(options), fp_(nullptr), count_(0), file_start_time_ms_(0)
 {
+	const char *env = std::getenv("RPICAM_FRAMES_SIDECAR");
+	frames_sidecar_enabled_ = env && std::strcmp(env, "1") == 0;
 }
 
 FileOutput::~FileOutput()
@@ -41,6 +55,25 @@ void FileOutput::outputBuffer(void *mem, size_t size, int64_t timestamp_us, uint
 			throw std::runtime_error("failed to write output bytes");
 		if (options_->flush)
 			fflush(fp_);
+
+		if (fp_frames_)
+		{
+			FrameSidecarRecord rec;
+			rec.index = frame_index_;
+			rec.byte_size = static_cast<uint32_t>(size);
+			rec.sensor_ts_ns = raw_sensor_ts_us_ * 1000;
+			rec.byte_offset = bytes_written_;
+			if (fwrite(&rec, sizeof(rec), 1, fp_frames_) != 1)
+			{
+				LOG_ERROR("FileOutput: frames sidecar write failed, disabling");
+				fclose(fp_frames_);
+				fp_frames_ = nullptr;
+			}
+			else if (options_->flush)
+				fflush(fp_frames_);
+		}
+		bytes_written_ += size;
+		frame_index_++;
 	}
 }
 
@@ -81,6 +114,16 @@ void FileOutput::openFile(int64_t timestamp_us)
 		LOG(2, "FileOutput: opened output file " << filename);
 
 		file_start_time_ms_ = timestamp_us / 1000;
+
+		frame_index_ = 0;
+		bytes_written_ = 0;
+		if (frames_sidecar_enabled_)
+		{
+			std::string sidecar = std::string(filename) + ".frames";
+			fp_frames_ = fopen(sidecar.c_str(), "w");
+			if (!fp_frames_)
+				LOG_ERROR("FileOutput: failed to open frames sidecar " << sidecar);
+		}
 	}
 }
 
@@ -93,5 +136,10 @@ void FileOutput::closeFile()
 		if (fp_ != stdout)
 			fclose(fp_);
 		fp_ = nullptr;
+	}
+	if (fp_frames_)
+	{
+		fclose(fp_frames_);
+		fp_frames_ = nullptr;
 	}
 }

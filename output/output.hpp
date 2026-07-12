@@ -35,6 +35,8 @@ protected:
 	virtual void timestampReady(int64_t timestamp);
 	VideoOptions const *options_;
 	FILE *fp_timestamps_;
+	// Raw (un-frigged) SensorTimestamp of the frame currently being output, for sidecar writers.
+	int64_t raw_sensor_ts_us_ = 0;
 
 private:
 	enum State

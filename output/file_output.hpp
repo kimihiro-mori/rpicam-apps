@@ -24,4 +24,9 @@ private:
 	FILE *fp_;
 	unsigned int count_;
 	int64_t file_start_time_ms_;
+	// Per-frame sidecar (<output>.frames), enabled with RPICAM_FRAMES_SIDECAR=1.
+	FILE *fp_frames_ = nullptr;
+	bool frames_sidecar_enabled_ = false;
+	uint32_t frame_index_ = 0;
+	uint64_t bytes_written_ = 0;
 };

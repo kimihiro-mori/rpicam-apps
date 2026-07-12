@@ -65,6 +65,9 @@ void Output::OutputReady(void *mem, size_t size, int64_t timestamp_us, bool keyf
 	if (state_ != RUNNING)
 		return;
 
+	// Keep the raw sensor timestamp available to sidecar writers before the pause-frig below.
+	raw_sensor_ts_us_ = timestamp_us;
+
 	// Frig the timestamps to be continuous after a pause.
 	if (flags & FLAG_RESTART)
 		time_offset_ = timestamp_us - last_timestamp_;
