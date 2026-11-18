@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -142,6 +144,103 @@ private:
 	}
 };
 
+class MainTap
+{
+public:
+	~MainTap()
+	{
+		{ std::lock_guard<std::mutex> lk(mtx_); stop_ = true; }
+		cv_.notify_one();
+		if (thread_.joinable()) thread_.join();
+	}
+
+	static std::unique_ptr<MainTap> Create()
+	{
+		const char *s = std::getenv("RPICAM_MAIN_TAP");
+		if (!s || !*s) return nullptr;
+		std::unique_ptr<MainTap> tap(new MainTap(s));
+		if (const char *i = std::getenv("RPICAM_MAIN_TAP_INTERVAL_MS"))
+			tap->interval_ms_ = std::max(1, std::atoi(i));
+		MainTap *t = tap.get();
+		tap->thread_ = std::thread([t] { t->workerLoop(); });
+		LOG(1, "MainTap: " << tap->path_ << " every " << tap->interval_ms_ << " ms while active");
+		return tap;
+	}
+
+	void Activate(int seconds)
+	{
+		active_until_ms_.store(nowMs() + int64_t(seconds) * 1000);
+	}
+
+	void Offer(const void *mem, size_t size)
+	{
+		int64_t now = nowMs();
+		if (now >= active_until_ms_.load() || now - last_offer_ms_ < interval_ms_)
+			return;
+		last_offer_ms_ = now;
+		const uint8_t *p = static_cast<const uint8_t *>(mem);
+		{
+			std::lock_guard<std::mutex> lk(mtx_);
+			buf_.assign(p, p + size);
+			ready_ = true;
+		}
+		cv_.notify_one();
+	}
+
+private:
+	explicit MainTap(const char *path) : path_(path), tmp_(std::string(path) + ".tmp") {}
+
+	static int64_t nowMs()
+	{
+		return std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+
+	void workerLoop()
+	{
+		std::vector<uint8_t> local;
+		while (true)
+		{
+			{
+				std::unique_lock<std::mutex> lk(mtx_);
+				cv_.wait(lk, [this] { return stop_ || ready_; });
+				if (stop_) break;
+				local.swap(buf_);
+				ready_ = false;
+			}
+			int fd = ::open(tmp_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (fd < 0)
+			{
+				if (!warned_) { LOG_ERROR("MainTap: cannot write " << tmp_); warned_ = true; }
+				continue;
+			}
+			size_t off = 0;
+			while (off < local.size())
+			{
+				ssize_t w = ::write(fd, local.data() + off, local.size() - off);
+				if (w <= 0) break;
+				off += static_cast<size_t>(w);
+			}
+			::close(fd);
+			if (off == local.size())
+				::rename(tmp_.c_str(), path_.c_str());
+		}
+	}
+
+	std::string path_;
+	std::string tmp_;
+	int interval_ms_ = 100;
+	std::atomic<int64_t> active_until_ms_{0};
+	int64_t last_offer_ms_ = 0;
+	std::mutex mtx_;
+	std::condition_variable cv_;
+	std::vector<uint8_t> buf_;
+	bool ready_ = false;
+	bool stop_ = false;
+	bool warned_ = false;
+	std::thread thread_;
+};
+
 // ---------------------------------------------------------------------------
 // UDP control receiver – reads RPICAM_CONTROL_UDP env ("port")
 // ---------------------------------------------------------------------------
@@ -155,11 +254,12 @@ public:
 	UdpControlReceiver(const UdpControlReceiver &) = delete;
 	UdpControlReceiver &operator=(const UdpControlReceiver &) = delete;
 	UdpControlReceiver(UdpControlReceiver &&o) noexcept
-		: fd_(o.fd_), stop_(o.stop_.load()), app_(o.app_), options_(o.options_)
+		: fd_(o.fd_), stop_(o.stop_.load()), app_(o.app_), options_(o.options_), tap_(o.tap_)
 	{
 		o.fd_ = -1;
 		o.app_ = nullptr;
 		o.options_ = nullptr;
+		o.tap_ = nullptr;
 	}
 	UdpControlReceiver &operator=(UdpControlReceiver &&o) noexcept
 	{
@@ -167,8 +267,8 @@ public:
 		{
 			Stop();
 			fd_ = o.fd_; stop_ = o.stop_.load();
-			app_ = o.app_; options_ = o.options_;
-			o.fd_ = -1; o.app_ = nullptr; o.options_ = nullptr;
+			app_ = o.app_; options_ = o.options_; tap_ = o.tap_;
+			o.fd_ = -1; o.app_ = nullptr; o.options_ = nullptr; o.tap_ = nullptr;
 		}
 		return *this;
 	}
@@ -204,11 +304,12 @@ public:
 
 	bool enabled() const { return fd_ >= 0; }
 
-	void Start(RPiCamEncoder *app, VideoOptions *options)
+	void Start(RPiCamEncoder *app, VideoOptions *options, MainTap *tap)
 	{
 		if (!enabled()) return;
 		app_ = app;
 		options_ = options;
+		tap_ = tap;
 		stop_ = false;
 		thread_ = std::thread([this] { recvLoop(); });
 	}
@@ -300,6 +401,13 @@ private:
 					options_->quality = q;
 				LOG(1, "Control: quality=" << q);
 			}
+			else if (key == "tap")
+			{
+				int sec = std::clamp(std::atoi(val.c_str()), 0, 60);
+				if (tap_)
+					tap_->Activate(sec);
+				LOG(2, "Control: tap=" << sec << "s");
+			}
 			else
 			{
 				LOG(1, "Control: unknown key '" << key << "'");
@@ -315,6 +423,7 @@ private:
 	std::thread thread_;
 	RPiCamEncoder *app_ = nullptr;
 	VideoOptions *options_ = nullptr;
+	MainTap *tap_ = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -444,8 +553,19 @@ static void event_loop(RPiCamEncoder &app)
 {
 	VideoOptions const *options = app.GetOptions();
 
+	std::unique_ptr<MainTap> tap = MainTap::Create();
 	auto output = std::unique_ptr<Output>(Output::Create(options));
-	app.SetEncodeOutputReadyCallback(std::bind(&Output::OutputReady, output.get(), _1, _2, _3, _4));
+	if (tap)
+	{
+		Output *out = output.get();
+		MainTap *t = tap.get();
+		app.SetEncodeOutputReadyCallback([out, t](void *mem, size_t size, int64_t timestamp_us, bool keyframe) {
+			t->Offer(mem, size);
+			out->OutputReady(mem, size, timestamp_us, keyframe);
+		});
+	}
+	else
+		app.SetEncodeOutputReadyCallback(std::bind(&Output::OutputReady, output.get(), _1, _2, _3, _4));
 	app.SetMetadataReadyCallback(std::bind(&Output::MetadataReady, output.get(), _1));
 
 	app.OpenCamera();
@@ -460,7 +580,7 @@ static void event_loop(RPiCamEncoder &app)
 
 	// UDP control receiver – allows runtime parameter changes
 	UdpControlReceiver ctrl = UdpControlReceiver::Create();
-	ctrl.Start(&app, const_cast<VideoOptions *>(options));
+	ctrl.Start(&app, const_cast<VideoOptions *>(options), tap.get());
 
 	app.StartEncoder();
 	app.StartCamera();
